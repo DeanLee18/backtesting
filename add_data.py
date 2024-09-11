@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import pandas as pd
 import qstock as qs
@@ -15,29 +16,28 @@ def add_data(dataframe, cerebro):
     :param dataframe: 从 qs.get_data 获取的股票数据
     :param cerebro: 初始化好的 cerebro 实例
     """
-    if 'date' in dataframe:
+    if 'time' in dataframe:
+        dataframe['time'] = pd.to_datetime(dataframe['time'], format='%Y%m%d%H%M%S%f')
+        dataframe.set_index('time', inplace=True)
+    elif 'date' in dataframe:
         dataframe.set_index('date', inplace=True)
-    if 'datetime' in dataframe:
+    elif 'datetime' in dataframe:
         dataframe.set_index('datetime', inplace=True)
     # 创建一个空的数据框用于对齐数据
     aligned_data = pd.DataFrame(index=dataframe.index.unique())
     processed_data = {}
 
     # 处理每一个股票代码的数据
-    for code in dataframe['code'].unique():
-        stock_data = dataframe.query(f"code == '{code}'")
+    for code_name in dataframe['code_name'].unique():
+        stock_data = dataframe.query(f"code_name == '{code_name}'")
         stock_data_aligned = pd.merge(aligned_data, stock_data, left_index=True, right_index=True, how='left')
 
         # 对齐数据框并填补缺失值
         stock_data_aligned = pd.merge(aligned_data, stock_data, left_index=True, right_index=True, how='left')
         stock_data_aligned[['volume']] = stock_data_aligned[['volume']].fillna(0)
-        stock_data_aligned[['code', 'open', 'high', 'low', 'close']] = \
-            stock_data_aligned[['code', 'open', 'high', 'low', 'close']].fillna(method='pad')
-        if 'code_name' in stock_data_aligned:
-            stock_data_aligned[['code_name']] = stock_data_aligned[['code_name']].fillna(method='pad')
-            processed_data[stock_data_aligned[['code_name']][0]] = stock_data_aligned
-        else:
-            processed_data[code] = stock_data_aligned
+        stock_data_aligned[['code', 'open', 'high', 'low', 'close', 'code_name']] = \
+            stock_data_aligned[['code', 'open', 'high', 'low', 'close', 'code_name']].fillna(method='pad')
+        processed_data[code_name] = stock_data_aligned
 
     # 将处理后的数据加载到 cerebro 中
     for name, data in processed_data.items():
@@ -45,17 +45,15 @@ def add_data(dataframe, cerebro):
         cerebro.adddata(datafeed, name=str(name))  # 加载到 cerebro 实例中
 
 if __name__ == '__main__':
-    dataframe = pd.read_csv("data/sh600000_history_k_data.csv", parse_dates=['date'])
-    print(dataframe)
-    # 为测试引入一些缺失值
-    # 人为删除部分行数据，模拟缺失的交易日
-    sample_indices = dataframe.sample(frac=0.5).index
-    dataframe.loc[sample_indices, 'code'] = '000000'
-    if 'code_name' in dataframe:
-        dataframe.loc[sample_indices, 'code_name'] = 'ABCD'
-    dataframe.loc[dataframe.sample(frac=0.05).index, 'close'] = np.nan
-    dataframe.loc[dataframe.sample(frac=0.05).index, 'volume'] = np.nan
-    print(dataframe)
+    # Load data
+    data_folder = './data/CSI_300_15minsk_since2017/k_data/'
+    dataframes = []
+    for i, file in enumerate(os.listdir(data_folder)):
+        if i >= 5:
+            break
+        df = pd.read_csv(os.path.join(data_folder, file))
+        dataframes.append(df)
+    dataframe = pd.concat(dataframes, ignore_index=True)
     
     # Create a cerebro entity
     cerebro = bt.Cerebro()

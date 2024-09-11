@@ -1,6 +1,13 @@
 import pandas as pd
 import backtrader as bt
 import qstock as qs
+import numpy as np
+import os
+import matplotlib.pyplot as plt
+
+from statsmodels.tsa.stattools import coint
+from itertools import combinations
+from tqdm import tqdm
 from base_strategy import BaseStrategy
 from add_data import add_data
 from set_broker import set_broker
@@ -26,41 +33,122 @@ Similarly, if you want to use some indicators, you can calculate before backtest
 ----------------------------------------------------------------------------------------------------
 '''
 
-class SmaStrategy(BaseStrategy):
+class FindCointegratedPairs:
+    def __init__(self, dataframe, threshold=0.05):
+        self.dataframe = dataframe
+        self.threshold = threshold
+
+    def check_cointegration(self, array1, array2):
+        # Calculate the cointegration between the two series
+        _, p_value, _ = coint(array1, array2)
+        # Check the cointegration level based on the p-value and threshold
+        return p_value < self.threshold
+
+    def check_pair(self, pair):
+        idx1, idx2 = pair
+        close1 = self.dataframe[idx1].close.array
+        close2 = self.dataframe[idx2].close.array
+        return (idx1, idx2) if self.check_cointegration(close1, close2) else None
+
+    def find_cointegrated_pairs(self):
+        cointegrated_pairs = []
+        pairs = list(combinations(range(len(self.dataframe)), 2))
+        
+        for pair in tqdm(pairs):
+            result = self.check_pair(pair)
+            if result is not None:
+                cointegrated_pairs.append(result)
+        
+        return cointegrated_pairs
+
+
+class PairTradingIndicator(bt.Indicator):
+    lines = ('signals',)
     params = dict(
-        period = 30,
+        split_ratio = 1,
+        window_size_short = 5,
+        window_size_long = 60,
+    )
+
+    # Indicators should be all calculated in init()
+    # or one-by-one in next().
+    # Note that its type is LineBuffer, not array or Series.
+    def __init__(self, series1, series2):
+        self.series1 = series1
+        self.series2 = series2
+        self.split_index = int(self.series1.buflen() * self.params.split_ratio)
+
+    def next(self):
+        ratio_short = np.concatenate(([np.array(self.series1.array)[0]], \
+                                      np.array(self.series1.array)[-self.params.window_size_short+1:])) / \
+                      np.concatenate(([np.array(self.series2.array)[0]], \
+                                      np.array(self.series2.array)[-self.params.window_size_short+1:]))
+        mean_short = float(ratio_short.mean())
+
+        ratio_long = np.concatenate(([np.array(self.series1.array)[0]], \
+                                     np.array(self.series1.array)[-self.params.window_size_long+1:])) / \
+                     np.concatenate(([np.array(self.series2.array)[0]], \
+                                     np.array(self.series2.array)[-self.params.window_size_long+1:]))
+        mean_long = float(ratio_long.mean())
+        std_long = float(ratio_long.std())
+
+        z_score = (mean_short - mean_long) / std_long
+
+        if z_score > 1:
+            self.lines.signals[0] = -1  # sell
+        elif z_score < -1:
+            self.lines.signals[0] = 1   # buy
+        elif abs(z_score) < 0.5:
+            self.lines.signals[0] = 0   # close
+        else:
+            self.lines.signals[0] = -2  # no actions
+
+
+class PairTradingStrategy(BaseStrategy):
+    params = dict(
         stake = 100,
     )
+
     def __init__(self):
-        self.inds = list()
-        for i, data in enumerate(self.datas):
-            self.inds.append(bt.indicators.SimpleMovingAverage(data.close, period=self.params.period))
-            # If you want to use other indicators, you can search in https://www.backtrader.com/docu/indautoref/
+        # stocks selection (data preprocess)
+        self.cointegrated_pairs = FindCointegratedPairs(self.datas).find_cointegrated_pairs()
+        print("select pairs:", self.cointegrated_pairs)
+        # indicators calculation
+        self.pair_indicator = dict()
+        for pairs in self.cointegrated_pairs:
+            series1 = self.datas[pairs[0]].close
+            series2 = self.datas[pairs[1]].close
+            self.pair_indicator[pairs[0]] = PairTradingIndicator(series1=series1, series2=series2)
+            self.pair_indicator[pairs[1]] = -PairTradingIndicator(series1=series1, series2=series2)
 
     def next(self):
         self.print_status()
-        for i, data in enumerate(self.datas):
-            position = self.getposition(data)
-            if not position.size:
-                if data.close[0] > self.inds[i][0]:
-                    self.buy(data = data, size = self.params.stake)  
-            elif data.close[0] < self.inds[i][0]:
-                self.sell(data = data, size = self.params.stake)
+        for pairs in self.cointegrated_pairs:
+            for idx in pairs:
+                if self.pair_indicator[idx][0] == 1 and not self.getposition(self.datas[idx]).size:
+                    self.buy(data = self.datas[idx], size = self.params.stake)
+                if self.pair_indicator[idx][0] == -1 and self.getposition(self.datas[idx]).size:
+                    self.close(data = self.datas[idx])
+                if self.pair_indicator[idx][0] == 0:
+                    self.close(data = self.datas[idx])
 
-if __name__ == '__main__':
+def example():
+    # Load Data
+    hs300_df = qs.index_member('hs300')
+    random_stock_codes = hs300_df['股票代码'].sample(n=20, random_state=1).tolist()
+    print(random_stock_codes)
+    dataframe = qs.get_data(random_stock_codes, \
+                            start='20240101', end='20240831', freq='d', fqt=1)
+    dataframe.rename(columns={'name': 'code_name'}, inplace=True)
+    print(dataframe)
+
     # Create a cerebro entity
     cerebro = bt.Cerebro()
 
     # Add a strategy
-    cerebro.addstrategy(SmaStrategy)
-
+    cerebro.addstrategy(PairTradingStrategy)
     # Add the Data Feed to Cerebro
-    stock_list = ['中国平安', '海科新源', '德尔股份', '南都电源', '科恒股份']
-    dataframe = qs.get_data(stock_list, start='20240101',end='20240831')
-    # dataframe = pd.read_csv("data/sh600000_history_k_data.csv", parse_dates=['date'])
-    # dataframe.loc[dataframe.sample(frac=0.5).index, 'code'] = '000000'
     add_data(dataframe, cerebro)
-
     # Set the broker
     set_broker(cerebro)
 
@@ -84,3 +172,6 @@ if __name__ == '__main__':
             # f"GrossLeverage: {result[0].analyzers._GrossLeverage.get_analysis()}, \n"
             # f"TimeReturn: {result[0].analyzers._TimeReturn.get_analysis()}"
     )
+
+if __name__ == '__main__':
+    example()
