@@ -62,51 +62,11 @@ class FindCointegratedPairs:
         return cointegrated_pairs
 
 
-class PairTradingIndicator(bt.Indicator):
-    lines = ('signals',)
-    params = dict(
-        split_ratio = 1,
-        window_size_short = 5,
-        window_size_long = 60,
-    )
-
-    # Indicators should be all calculated in init()
-    # or one-by-one in next().
-    # Note that its type is LineBuffer, not array or Series.
-    def __init__(self, series1, series2):
-        self.series1 = series1
-        self.series2 = series2
-        self.split_index = int(self.series1.buflen() * self.params.split_ratio)
-
-    def next(self):
-        ratio_short = np.concatenate(([np.array(self.series1.array)[0]], \
-                                      np.array(self.series1.array)[-self.params.window_size_short+1:])) / \
-                      np.concatenate(([np.array(self.series2.array)[0]], \
-                                      np.array(self.series2.array)[-self.params.window_size_short+1:]))
-        mean_short = float(ratio_short.mean())
-
-        ratio_long = np.concatenate(([np.array(self.series1.array)[0]], \
-                                     np.array(self.series1.array)[-self.params.window_size_long+1:])) / \
-                     np.concatenate(([np.array(self.series2.array)[0]], \
-                                     np.array(self.series2.array)[-self.params.window_size_long+1:]))
-        mean_long = float(ratio_long.mean())
-        std_long = float(ratio_long.std())
-
-        z_score = (mean_short - mean_long) / std_long
-
-        if z_score > 1:
-            self.lines.signals[0] = -1  # sell
-        elif z_score < -1:
-            self.lines.signals[0] = 1   # buy
-        elif abs(z_score) < 0.5:
-            self.lines.signals[0] = 0   # close
-        else:
-            self.lines.signals[0] = -2  # no actions
-
-
 class PairTradingStrategy(BaseStrategy):
     params = dict(
         stake = 100,
+        window_size_short = 5,
+        window_size_long = 60,
     )
 
     def __init__(self):
@@ -114,28 +74,47 @@ class PairTradingStrategy(BaseStrategy):
         self.cointegrated_pairs = FindCointegratedPairs(self.datas).find_cointegrated_pairs()
         print("select pairs:", self.cointegrated_pairs)
         # indicators calculation
-        self.pair_indicator = dict()
+        self.sma_short = dict()
+        self.sma_long = dict()
+        self.std_long = dict()
         for pairs in self.cointegrated_pairs:
-            series1 = self.datas[pairs[0]].close
-            series2 = self.datas[pairs[1]].close
-            self.pair_indicator[pairs[0]] = PairTradingIndicator(series1=series1, series2=series2)
-            self.pair_indicator[pairs[1]] = -PairTradingIndicator(series1=series1, series2=series2)
+            raito = self.datas[pairs[0]].close / self.datas[pairs[1]].close
+            self.sma_short[pairs] = bt.indicators.SimpleMovingAverage(raito, period=self.params.window_size_short)
+            self.sma_long[pairs] = bt.indicators.SimpleMovingAverage(raito, period=self.params.window_size_long)
+            self.std_long[pairs] = bt.indicators.StandardDeviation(raito, period=self.params.window_size_long)
 
     def next(self):
-        self.print_status()
         for pairs in self.cointegrated_pairs:
-            for idx in pairs:
-                if self.pair_indicator[idx][0] == 1 and not self.getposition(self.datas[idx]).size:
-                    self.buy(data = self.datas[idx], size = self.params.stake)
-                if self.pair_indicator[idx][0] == -1 and self.getposition(self.datas[idx]).size:
-                    self.close(data = self.datas[idx])
-                if self.pair_indicator[idx][0] == 0:
-                    self.close(data = self.datas[idx])
+            z_score = (self.sma_short[pairs][0] - self.sma_long[pairs][0]) / self.std_long[pairs][0]
+            if z_score > 1:
+                # sell 0 buy 1
+                self.log("sell {} and buy {}".format(self.datas[pairs[0]]._name, self.datas[pairs[1]]._name))
+                if self.getposition(self.datas[pairs[0]]).size:
+                    self.close(data = self.datas[pairs[0]])
+                if not self.getposition(self.datas[pairs[1]]).size:
+                    self.buy(data = self.datas[pairs[1]], size = self.params.stake)
+            elif z_score < -1:
+                # buy 0 sell 1
+                self.log("sell {} and buy {}".format(self.datas[pairs[1]]._name, self.datas[pairs[0]]._name))
+                if not self.getposition(self.datas[pairs[0]]).size:
+                    self.buy(data = self.datas[pairs[0]], size = self.params.stake)
+                if self.getposition(self.datas[pairs[1]]).size:
+                    self.close(data = self.datas[pairs[1]])
+            elif abs(z_score) < 0.5:
+                # close
+                self.log("sell {} and {}".format(self.datas[pairs[0]]._name, self.datas[pairs[1]]._name))
+                if self.getposition(self.datas[pairs[0]]).size:
+                    self.close(data = self.datas[pairs[0]])
+                if self.getposition(self.datas[pairs[1]]).size:
+                    self.close(data = self.datas[pairs[1]])
+            else:
+                # no actions
+                pass
 
 def example():
     # Load Data
     hs300_df = qs.index_member('hs300')
-    random_stock_codes = hs300_df['股票代码'].sample(n=20, random_state=1).tolist()
+    random_stock_codes = hs300_df['股票代码'].sample(n=10, random_state=1).tolist()
     print(random_stock_codes)
     dataframe = qs.get_data(random_stock_codes, \
                             start='20240101', end='20240831', freq='d', fqt=1)
@@ -172,6 +151,9 @@ def example():
             # f"GrossLeverage: {result[0].analyzers._GrossLeverage.get_analysis()}, \n"
             # f"TimeReturn: {result[0].analyzers._TimeReturn.get_analysis()}"
     )
+    # Plot the back trading process
+    cerebro.plot()
+    plt.show()
 
 if __name__ == '__main__':
     example()
